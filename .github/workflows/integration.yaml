@@ -64,6 +64,20 @@ jobs:
           echo "localhost:5432:*:skyportal:anything" > ~/.pgpass && chmod 600 ~/.pgpass
           createdb -h localhost -U skyportal skyportal || true
           cp config.yaml.defaults config.yaml
+          # Boot the API-only stack: disable `rspack` (the webpack/JS bundler
+          # service) — it's the slow, non-deterministic part of `make run` (boots
+          # ranged 5→17 min, then timed out) and the API health check / read-only
+          # tests don't need the frontend bundle. Keep `dask` disabled (default).
+          # Written with echo (not a heredoc) so the keys land flush-left.
+          {
+            echo ""
+            echo "services:"
+            echo "  disabled:"
+            echo "    - dask"
+            echo "    - rspack"
+          } >> config.yaml
+          # Safety: satisfy anything that expects the bundle file to exist.
+          mkdir -p static/build && touch static/build/main.bundle.js
           uv sync --inexact --group dev
           make db_init
           # NOTE: do NOT run `make load_demo_data` here — it's an API client that
