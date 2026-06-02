@@ -1,44 +1,40 @@
-name: integration (spin up SkyPortal)
+name: integration (SkyPortal via Docker)
 
-# Best-effort: stand up a fresh mainline SkyPortal in CI and run skybot's
-# integration tests against it. The postgres service + config + db_init steps
-# mirror skyportal/skyportal's own `test_api_and_frontend.yaml`; the token is
-# the provisioned INITIAL_ADMIN written to .tokens.yaml by `make load_demo_data`.
+# Spin up mainline SkyPortal using its OWN supported Docker deployment and run
+# skybot's read-only integration suite against it. Secret-free: the admin token
+# is self-provisioned by the app into .tokens.yaml on boot and read out of the
+# container.
 #
-# NOTE: booting a full SkyPortal in CI is heavy and the exact `make` targets /
-# app port can drift with upstream — treat this as a template to finalize
-# against the SkyPortal revision you pin. Manual trigger only.
+# Why Docker (not `make run`): the Dockerfile bakes the JS bundle at build time
+# (`rspack --mode=production`) and runs `make run_production` — no debug webpack
+# watcher, no supervisord-under-nohup. That's deterministic; bare-metal `make
+# run` was not. Flow mirrors doc/deploy.md.
 #
-# Validates skybot against MAINLINE SkyPortal (read-only: auth, groups,
-# taxonomies, instruments). Source-specific + write round-trips are covered by
-# the secrets-based `integration.yaml` against a real instance with a known obj.
+# Runs per push/PR (immediate signal on SkyPortal API drift — the main
+# regression risk) plus a nightly to catch drift on no-commit days. The image
+# build is heavy; `concurrency` below cancels superseded runs on the same ref so
+# they don't pile up, and Docker layer caching keeps rebuilds reasonable.
 
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 7 * * *" # nightly 07:00 UTC — catches SkyPortal main drift on no-commit days
   workflow_dispatch:
     inputs:
       skyportal_ref:
         description: "skyportal/skyportal git ref to test against"
         default: "main"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  spin-up:
+  docker-integration:
     runs-on: ubuntu-latest
-    # SkyPortal's own CI uses timeout-minutes: 120 — a cold webpack build on a
-    # 2-core runner is just slow, so give it room rather than capping at 15 min.
-    timeout-minutes: 60
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_USER: skyportal
-          POSTGRES_PASSWORD: anything
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd pg_isready --health-interval 10s
-          --health-timeout 5s --health-retries 5
+    timeout-minutes: 90
     steps:
       - name: Checkout skybot
         uses: actions/checkout@v4
@@ -55,83 +51,61 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - name: Install uv
-        run: pip install uv
+          python-version: "3.13"
 
-      # Mirror SkyPortal's CI: cache the npm download dir so the cold install
-      # doesn't eat into the boot budget (keyed on SkyPortal's package.json).
-      - name: Cache ~/.npm
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-npm-${{ hashFiles('skyportal/package.json') }}
-          restore-keys: ${{ runner.os }}-npm-
-
-      - name: Initialize SkyPortal DB
-        working-directory: skyportal
-        env:
-          NPM_CONFIG_LEGACY_PEER_DEPS: "true"
-        run: |
-          echo "localhost:5432:*:skyportal:anything" > ~/.pgpass && chmod 600 ~/.pgpass
-          createdb -h localhost -U skyportal skyportal || true
-          cp config.yaml.defaults config.yaml
-          # NOTE: keep rspack ENABLED. The app needs the built frontend assets
-          # (HtmlRspackPlugin generates index.html); disabling rspack inverted
-          # the result (it then never became healthy). The build is just slow —
-          # we wait it out (see timeout-minutes + the boot wait below), exactly
-          # as SkyPortal's own CI does.
-          uv sync --inexact --group dev
-          make db_init
-          # NOTE: do NOT run `make load_demo_data` here — it's an API client that
-          # POSTs to a *running* server. The app itself provisions the initial
-          # token + writes .tokens.yaml on boot (app_server.py), so booting next
-          # is what makes the token available. Demo sources aren't needed for the
-          # read-only tests anyway.
-
-      - name: Boot SkyPortal (API) and wait for health
+      - name: Build + start SkyPortal (web + db) via docker compose
         working-directory: skyportal
         run: |
-          # `make run` is the full stack in --debug (incl. the webpack watcher),
-          # so a cold boot on a 2-core runner can take well over 5 min before
-          # /api/sysinfo answers. Wait generously and tail the log each minute so
-          # a genuine hang is distinguishable from a slow-but-progressing boot.
-          nohup make run > skyportal_run.log 2>&1 &
-          up=0
-          for i in $(seq 1 480); do          # 480 * 5s = 40 min (job timeout is the real cap)
-            if curl -sf http://localhost:5000/api/sysinfo > /dev/null; then
-              echo "SkyPortal up after ~$((i * 5))s"; up=1; break
+          # BuildKit for a faster, layer-cached image build.
+          export DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1
+          docker compose up -d --build
+
+      - name: Wait for Postgres
+        working-directory: skyportal
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose exec -T db pg_isready -U skyportal >/dev/null 2>&1; then
+              echo "db ready"; break
             fi
-            if [ $((i % 12)) -eq 0 ]; then    # every ~60s, show real progress
-              echo "--- still waiting (~$((i * 5))s) ---"
-              tail -5 skyportal_run.log || true
-              echo "--- log/app.log / log/nginx.log tails: ---"
-              tail -15 log/app.log 2>/dev/null || true
-              tail -5 log/nginx.log 2>/dev/null || true
+            sleep 5
+          done
+
+      - name: Initialize database (create tables)
+        working-directory: skyportal
+        run: |
+          # Production image does NOT auto-create tables (doc/deploy.md). Do it once.
+          docker compose exec -T web bash -c \
+            'source .venv/bin/activate && FLAGS="--config=config.yaml" make db_create_tables'
+
+      - name: Wait for API health (localhost:9000 -> container :5000)
+        run: |
+          up=0
+          for i in $(seq 1 120); do        # 10 min; run_production serves a prebuilt bundle, so this is quick
+            if curl -sf http://localhost:9000/api/sysinfo > /dev/null; then
+              echo "SkyPortal up after ~$((i * 5))s"; up=1; break
             fi
             sleep 5
           done
           if [ "$up" -ne 1 ]; then
-            echo "::error::SkyPortal did not answer /api/sysinfo in time"
-            echo "=== skyportal_run.log ==="; tail -100 skyportal_run.log || true
-            echo "=== log/*.log ==="; tail -50 log/*.log 2>/dev/null || true
-            exit 1
+            echo "::error::SkyPortal API never answered"; exit 1
           fi
 
-      - name: Export base URL + provisioned token
+      - name: Read self-provisioned admin token
         working-directory: skyportal
         run: |
-          # .tokens.yaml is a single line "INITIAL_ADMIN: <id>" written by the app
-          # on boot — parse with awk so we don't depend on PyYAML being importable
-          # from the runner's python (uv installs deps into skyportal/.venv).
-          if [ ! -f .tokens.yaml ]; then
-            echo "::error::.tokens.yaml not found in $(pwd)"; ls -la; exit 1
-          fi
-          TOKEN=$(awk '/INITIAL_ADMIN:/ {print $2; exit}' .tokens.yaml)
+          # The app writes .tokens.yaml (INITIAL_ADMIN) a few seconds after the
+          # tables exist (doc/deploy.md). Poll for it inside the container.
+          TOKEN=""
+          for i in $(seq 1 24); do          # up to 2 min
+            TOKEN=$(docker compose exec -T web sh -c \
+              "awk '/INITIAL_ADMIN:/ {print \$2; exit}' .tokens.yaml" 2>/dev/null | tr -d '\r')
+            [ -n "$TOKEN" ] && break
+            sleep 5
+          done
           if [ -z "$TOKEN" ]; then
-            echo "::error::INITIAL_ADMIN missing from .tokens.yaml"; cat .tokens.yaml; exit 1
+            echo "::error::.tokens.yaml / INITIAL_ADMIN not found"; exit 1
           fi
-          echo "SKYBOT_TEST_BASE=http://localhost:5000" >> "$GITHUB_ENV"
+          echo "SKYBOT_TEST_BASE=http://localhost:9000" >> "$GITHUB_ENV"
           echo "SKYBOT_TEST_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
       - name: Install skybot + run integration tests (read-only)
@@ -139,3 +113,8 @@ jobs:
         run: |
           pip install -e ".[dev]"
           pytest -m integration -q
+
+      - name: SkyPortal logs on failure
+        if: failure()
+        working-directory: skyportal
+        run: docker compose logs --tail 200 || true
