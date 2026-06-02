@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = ["requests>=2.28"]
 
 [project.optional-dependencies]
+gcn = ["gcn-kafka>=0.3"]
 dev = ["pytest>=7", "ruff>=0.9", "pre-commit>=3"]
 
 [tool.setuptools.packages.find]
