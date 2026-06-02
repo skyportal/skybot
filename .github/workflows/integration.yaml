@@ -26,6 +26,9 @@ on:
 jobs:
   spin-up:
     runs-on: ubuntu-latest
+    # SkyPortal's own CI uses timeout-minutes: 120 — a cold webpack build on a
+    # 2-core runner is just slow, so give it room rather than capping at 15 min.
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:17
@@ -56,6 +59,15 @@ jobs:
       - name: Install uv
         run: pip install uv
 
+      # Mirror SkyPortal's CI: cache the npm download dir so the cold install
+      # doesn't eat into the boot budget (keyed on SkyPortal's package.json).
+      - name: Cache ~/.npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('skyportal/package.json') }}
+          restore-keys: ${{ runner.os }}-npm-
+
       - name: Initialize SkyPortal DB
         working-directory: skyportal
         env:
@@ -64,20 +76,11 @@ jobs:
           echo "localhost:5432:*:skyportal:anything" > ~/.pgpass && chmod 600 ~/.pgpass
           createdb -h localhost -U skyportal skyportal || true
           cp config.yaml.defaults config.yaml
-          # Boot the API-only stack: disable `rspack` (the webpack/JS bundler
-          # service) — it's the slow, non-deterministic part of `make run` (boots
-          # ranged 5→17 min, then timed out) and the API health check / read-only
-          # tests don't need the frontend bundle. Keep `dask` disabled (default).
-          # Written with echo (not a heredoc) so the keys land flush-left.
-          {
-            echo ""
-            echo "services:"
-            echo "  disabled:"
-            echo "    - dask"
-            echo "    - rspack"
-          } >> config.yaml
-          # Safety: satisfy anything that expects the bundle file to exist.
-          mkdir -p static/build && touch static/build/main.bundle.js
+          # NOTE: keep rspack ENABLED. The app needs the built frontend assets
+          # (HtmlRspackPlugin generates index.html); disabling rspack inverted
+          # the result (it then never became healthy). The build is just slow —
+          # we wait it out (see timeout-minutes + the boot wait below), exactly
+          # as SkyPortal's own CI does.
           uv sync --inexact --group dev
           make db_init
           # NOTE: do NOT run `make load_demo_data` here — it's an API client that
@@ -95,19 +98,24 @@ jobs:
           # a genuine hang is distinguishable from a slow-but-progressing boot.
           nohup make run > skyportal_run.log 2>&1 &
           up=0
-          for i in $(seq 1 180); do          # 180 * 5s = 15 min ceiling
+          for i in $(seq 1 480); do          # 480 * 5s = 40 min (job timeout is the real cap)
             if curl -sf http://localhost:5000/api/sysinfo > /dev/null; then
               echo "SkyPortal up after ~$((i * 5))s"; up=1; break
             fi
-            if [ $((i % 12)) -eq 0 ]; then
-              echo "--- still waiting (~$((i * 5))s); tail of skyportal_run.log: ---"
-              tail -20 skyportal_run.log || true
+            if [ $((i % 12)) -eq 0 ]; then    # every ~60s, show real progress
+              echo "--- still waiting (~$((i * 5))s) ---"
+              tail -5 skyportal_run.log || true
+              echo "--- log/app.log / log/nginx.log tails: ---"
+              tail -15 log/app.log 2>/dev/null || true
+              tail -5 log/nginx.log 2>/dev/null || true
             fi
             sleep 5
           done
           if [ "$up" -ne 1 ]; then
-            echo "::error::SkyPortal did not answer /api/sysinfo within 15 min"
-            tail -200 skyportal_run.log; exit 1
+            echo "::error::SkyPortal did not answer /api/sysinfo in time"
+            echo "=== skyportal_run.log ==="; tail -100 skyportal_run.log || true
+            echo "=== log/*.log ==="; tail -50 log/*.log 2>/dev/null || true
+            exit 1
           fi
 
       - name: Export base URL + provisioned token
