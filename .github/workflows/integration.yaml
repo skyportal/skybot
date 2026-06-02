@@ -75,14 +75,26 @@ jobs:
       - name: Boot SkyPortal (API) and wait for health
         working-directory: skyportal
         run: |
+          # `make run` is the full stack in --debug (incl. the webpack watcher),
+          # so a cold boot on a 2-core runner can take well over 5 min before
+          # /api/sysinfo answers. Wait generously and tail the log each minute so
+          # a genuine hang is distinguishable from a slow-but-progressing boot.
           nohup make run > skyportal_run.log 2>&1 &
-          for i in $(seq 1 60); do
+          up=0
+          for i in $(seq 1 180); do          # 180 * 5s = 15 min ceiling
             if curl -sf http://localhost:5000/api/sysinfo > /dev/null; then
-              echo "SkyPortal up"; break
+              echo "SkyPortal up after ~$((i * 5))s"; up=1; break
+            fi
+            if [ $((i % 12)) -eq 0 ]; then
+              echo "--- still waiting (~$((i * 5))s); tail of skyportal_run.log: ---"
+              tail -20 skyportal_run.log || true
             fi
             sleep 5
           done
-          curl -sf http://localhost:5000/api/sysinfo || (echo "SkyPortal did not start"; tail -100 skyportal_run.log; exit 1)
+          if [ "$up" -ne 1 ]; then
+            echo "::error::SkyPortal did not answer /api/sysinfo within 15 min"
+            tail -200 skyportal_run.log; exit 1
+          fi
 
       - name: Export base URL + provisioned token
         working-directory: skyportal
