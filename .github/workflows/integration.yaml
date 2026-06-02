@@ -56,7 +56,7 @@ jobs:
       - name: Install uv
         run: pip install uv
 
-      - name: Initialize SkyPortal DB + provision token + demo data
+      - name: Initialize SkyPortal DB
         working-directory: skyportal
         env:
           NPM_CONFIG_LEGACY_PEER_DEPS: "true"
@@ -66,8 +66,11 @@ jobs:
           cp config.yaml.defaults config.yaml
           uv sync --inexact --group dev
           make db_init
-          # writes .tokens.yaml (INITIAL_ADMIN) and seeds demo sources
-          make load_demo_data
+          # NOTE: do NOT run `make load_demo_data` here — it's an API client that
+          # POSTs to a *running* server. The app itself provisions the initial
+          # token + writes .tokens.yaml on boot (app_server.py), so booting next
+          # is what makes the token available. Demo sources aren't needed for the
+          # read-only tests anyway.
 
       - name: Boot SkyPortal (API) and wait for health
         working-directory: skyportal
