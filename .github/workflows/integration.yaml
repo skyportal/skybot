@@ -87,8 +87,17 @@ jobs:
       - name: Export base URL + provisioned token
         working-directory: skyportal
         run: |
+          # .tokens.yaml is a single line "INITIAL_ADMIN: <id>" written by the app
+          # on boot — parse with awk so we don't depend on PyYAML being importable
+          # from the runner's python (uv installs deps into skyportal/.venv).
+          if [ ! -f .tokens.yaml ]; then
+            echo "::error::.tokens.yaml not found in $(pwd)"; ls -la; exit 1
+          fi
+          TOKEN=$(awk '/INITIAL_ADMIN:/ {print $2; exit}' .tokens.yaml)
+          if [ -z "$TOKEN" ]; then
+            echo "::error::INITIAL_ADMIN missing from .tokens.yaml"; cat .tokens.yaml; exit 1
+          fi
           echo "SKYBOT_TEST_BASE=http://localhost:5000" >> "$GITHUB_ENV"
-          TOKEN=$(python -c "import yaml; print(yaml.safe_load(open('.tokens.yaml'))['INITIAL_ADMIN'])")
           echo "SKYBOT_TEST_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
       - name: Install skybot + run integration tests (read-only)
