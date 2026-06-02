@@ -1,0 +1,32 @@
+name: integration (against a provided SkyPortal)
+
+# Runs the integration tests against an existing SkyPortal instance whose
+# base URL + token are supplied as repo secrets. Read-only by default; do NOT
+# enable SKYBOT_TEST_WRITE against a production instance.
+#
+# Required secrets:
+#   SKYBOT_TEST_BASE   e.g. https://fritz.science
+#   SKYBOT_TEST_TOKEN  an API token for that instance
+# Optional secrets:
+#   SKYBOT_TEST_OBJ    a known source id (enables get_source); leave unset to skip
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * 1"   # weekly Monday 07:00 UTC
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: pytest -m integration (read-only)
+        env:
+          SKYBOT_TEST_BASE: ${{ secrets.SKYBOT_TEST_BASE }}
+          SKYBOT_TEST_TOKEN: ${{ secrets.SKYBOT_TEST_TOKEN }}
+          SKYBOT_TEST_OBJ: ${{ secrets.SKYBOT_TEST_OBJ }}
+        run: pytest -m integration -q

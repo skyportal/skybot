@@ -1,0 +1,92 @@
+name: integration (spin up SkyPortal)
+
+# Best-effort: stand up a fresh mainline SkyPortal in CI and run skybot's
+# integration tests against it. The postgres service + config + db_init steps
+# mirror skyportal/skyportal's own `test_api_and_frontend.yaml`; the token is
+# the provisioned INITIAL_ADMIN written to .tokens.yaml by `make load_demo_data`.
+#
+# NOTE: booting a full SkyPortal in CI is heavy and the exact `make` targets /
+# app port can drift with upstream — treat this as a template to finalize
+# against the SkyPortal revision you pin. Manual trigger only.
+#
+# Validates skybot against MAINLINE SkyPortal (read-only: auth, groups,
+# taxonomies, instruments). Source-specific + write round-trips are covered by
+# the secrets-based `integration.yaml` against a real instance with a known obj.
+
+on:
+  workflow_dispatch:
+    inputs:
+      skyportal_ref:
+        description: "skyportal/skyportal git ref to test against"
+        default: "main"
+
+jobs:
+  spin-up:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: skyportal
+          POSTGRES_PASSWORD: anything
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    steps:
+      - name: Checkout skybot
+        uses: actions/checkout@v4
+        with:
+          path: skybot
+
+      - name: Checkout SkyPortal
+        uses: actions/checkout@v4
+        with:
+          repository: skyportal/skyportal
+          ref: ${{ inputs.skyportal_ref }}
+          submodules: recursive
+          path: skyportal
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+
+      - name: Initialize SkyPortal DB + provision token + demo data
+        working-directory: skyportal
+        env:
+          NPM_CONFIG_LEGACY_PEER_DEPS: "true"
+        run: |
+          echo "localhost:5432:*:skyportal:anything" > ~/.pgpass && chmod 600 ~/.pgpass
+          createdb -h localhost -U skyportal skyportal || true
+          cp config.yaml.defaults config.yaml
+          uv sync --inexact --group dev
+          make db_init
+          # writes .tokens.yaml (INITIAL_ADMIN) and seeds demo sources
+          make load_demo_data
+
+      - name: Boot SkyPortal (API) and wait for health
+        working-directory: skyportal
+        run: |
+          nohup make run > skyportal_run.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5000/api/sysinfo > /dev/null; then
+              echo "SkyPortal up"; break
+            fi
+            sleep 5
+          done
+          curl -sf http://localhost:5000/api/sysinfo || (echo "SkyPortal did not start"; tail -100 skyportal_run.log; exit 1)
+
+      - name: Export base URL + provisioned token
+        working-directory: skyportal
+        run: |
+          echo "SKYBOT_TEST_BASE=http://localhost:5000" >> "$GITHUB_ENV"
+          TOKEN=$(python -c "import yaml; print(yaml.safe_load(open('.tokens.yaml'))['INITIAL_ADMIN'])")
+          echo "SKYBOT_TEST_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Install skybot + run integration tests (read-only)
+        working-directory: skybot
+        run: |
+          pip install -e ".[dev]"
+          pytest -m integration -q
