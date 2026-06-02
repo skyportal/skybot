@@ -14,6 +14,9 @@ name: integration (spin up SkyPortal)
 # the secrets-based `integration.yaml` against a real instance with a known obj.
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
     inputs:
       skyportal_ref:
@@ -43,7 +46,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: skyportal/skyportal
-          ref: ${{ inputs.skyportal_ref }}
+          ref: ${{ inputs.skyportal_ref || 'main' }}
           submodules: recursive
           path: skyportal
 
